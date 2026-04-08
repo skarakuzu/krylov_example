@@ -154,7 +154,7 @@ def ed_wrapper(comm,
     
     siam_type = 1
     do_ed = 1
-    ed_solver = 0 # 2
+    ed_solver = 2 # 2
     neval = 3
     nvector = 3
     ncv = 100

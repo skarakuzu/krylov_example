@@ -2,6 +2,7 @@ from hash_basis_methods import FockBinByN, get_H #get_H_emat, get_H_umat
 from lanczos import lanczos_tridiagonal
 
 import edrixs
+import time
 
 from slepc4py import SLEPc
 from petsc4py import PETSc
@@ -32,17 +33,64 @@ from manybody_operator_csr import two_fermion_csr, four_fermion_csr
 def ed_petsc_solver(comm, emat, umat, basis, neval, eigval_tol, maxiter):
     #H = get_H_emat(comm, emat, basis) # sensible for MPI?
     #H += get_H_umat(comm, umat, basis)
+    #print("Petsc H formation begin...", flush=True)
+    #t0 = time.perf_counter()
+    #H = get_H(comm, emat, umat, basis)
+    #t1 = time.perf_counter()
+    #duration = t1 - t0
+    #print(f"Hamiltonian formation took about {duration:.6f} seconds", flush=True)
+
+    #info = H.getInfo()
+    #mtype = H.getType()
+    #print(f"[INFO] Hamiltonian assembled with matrix type {mtype}.")
+    #print(f"[INFO] nz_allocated = {info.get('nz_allocated','N/A')}")
+
+    #t0 = time.perf_counter()
+    
+    #E = SLEPc.EPS().create()
+    #E = SLEPc.EPS().create(comm=comm)
+    #E.setOperators(H)
+    #E.setType(SLEPc.EPS.Type.LOBPCG)
+    #E.setTolerances(tol=eigval_tol, max_it=maxiter)
+    
+    #E.setProblemType(SLEPc.EPS.ProblemType.HEP)  # Hermitian eigenproblem
+    #E.setDimensions(neval)
+    #E.setWhichEigenpairs(SLEPc.EPS.Which.SMALLEST_REAL)
+    #E.solve()
+    
+    rank = comm.rank
+
+    print(f"[rank {rank}] building H", flush=True)
+    t0 = time.perf_counter()
     H = get_H(comm, emat, umat, basis)
-    E = SLEPc.EPS().create()
+    t1 = time.perf_counter()
+    print(f"[rank {rank}] H build time: {t1 - t0:.6f} s", flush=True)
+    print(f"[rank {rank}] H type: {H.getType()}", flush=True)
+    print(f"[rank {rank}] H size: {H.getSizes()}", flush=True)
+
+    # If you want command-line control of the matrix type, do this in get_H:
+    # H.setFromOptions()
+    # instead of hardcoding H.setType(PETSc.Mat.Type.AIJ)
+
+    E = SLEPc.EPS().create(comm=comm)
     E.setOperators(H)
-    E.setType(SLEPc.EPS.Type.LOBPCG)
-    E.setTolerances(tol=eigval_tol, max_it=maxiter)
-    
-    E.setProblemType(SLEPc.EPS.ProblemType.HEP)  # Hermitian eigenproblem
-    E.setDimensions(neval)
+    #E.setType(SLEPc.EPS.Type.LOBPCG)
+    E.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
+    E.setProblemType(SLEPc.EPS.ProblemType.HEP)
     E.setWhichEigenpairs(SLEPc.EPS.Which.SMALLEST_REAL)
+    E.setTolerances(tol=eigval_tol, max_it=maxiter)
+    #E.setDimensions(neval, max(2 * neval, neval + 5), PETSc.DECIDE)
+    E.setDimensions(neval)
+    #E.setFromOptions()
+
+    print(f"[rank {rank}] EPS type before solve: {E.getType()}", flush=True)
     E.solve()
-    
+
+    nconv = E.getConverged()
+    reason = E.getConvergedReason()
+    print(f"[rank {rank}] converged={nconv}, reason={reason}", flush=True)
+
+
     nconv = E.getConverged()
     assert nconv>=neval
     
@@ -53,11 +101,16 @@ def ed_petsc_solver(comm, emat, umat, basis, neval, eigval_tol, maxiter):
     for ind in range(neval):
         k = E.getEigenpair(ind, vr)
         eval_i[ind] = k
+        if rank == 0:
+            print(f"Eval[ind]=", eval_i)
         evec_i[ind] = vr.copy() # copy is crucial. 
         errors[ind] = E.computeError(ind, SLEPc.EPS.ErrorType.RELATIVE)
     
     if np.any(errors > eigval_tol):
         raise Exception(f"Errors are {errors}")
+    t1 = time.perf_counter()
+    duration = t1 - t0
+    print(f"PETSC Eigenvalue solve duarion was {duration:.6f} seconds")
     return eval_i, evec_i
 
 def ed_siam_petsc(comm, shell_name, nbath, *, siam_type=0, v_noccu=1, static_core_pot=0, c_level=0,
@@ -205,7 +258,7 @@ def ed_siam_petsc(comm, shell_name, nbath, *, siam_type=0, v_noccu=1, static_cor
     size = comm.Get_size()
     fcomm = comm.py2f()
     if rank == 0:
-        print("edrixs >>> Running ED ...", flush=True)
+        print("edrixs >>> PETSC Running ED ...", flush=True)
 
     v_name_options = ['s', 'p', 't2g', 'd', 'f']
     c_name_options = ['s', 'p', 'p12', 'p32', 't2g', 'd', 'd32', 'd52', 'f', 'f52', 'f72']
@@ -238,7 +291,6 @@ def ed_siam_petsc(comm, shell_name, nbath, *, siam_type=0, v_noccu=1, static_cor
         else:
             slater_n[:] = slater[1][0:nslat]
 
-    # print summary of slater integrals
     if rank == 0:
         print(flush=True)
         print("    Summary of Slater integrals:", flush=True)
@@ -250,7 +302,6 @@ def ed_siam_petsc(comm, shell_name, nbath, *, siam_type=0, v_noccu=1, static_cor
                 ":  {:20.10f}{:20.10f}".format(slater_i[i], slater_n[i]), flush=True
             )
         print(flush=True)
-
     umat_tmp_i = get_umat_slater(v_name + c_name, *slater_i)
     umat_tmp_n = get_umat_slater(v_name + c_name, *slater_n)
 

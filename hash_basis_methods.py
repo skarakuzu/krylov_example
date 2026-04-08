@@ -1,48 +1,23 @@
 import numpy as np
-from scipy.sparse import coo_matrix
 from math import comb, prod
-
 from dataclasses import dataclass, field
 from typing import List, Tuple
-from itertools import accumulate
 
-from slepc4py import SLEPc
+from numba import njit
 from petsc4py import PETSc
+from scipy.sparse import coo_matrix
+
+
 
 @dataclass(slots=True)
 class FockBinByN:
-    """Basis class to handle the product space of fixed-particle-number
-    Fock subspaces.
-
-    Parameters
-    ----------
-    shapes
-        List of ``(norb, noccu)`get ` pairs, one per subspace.
-
-    Attributes
-    ----------
-    norbs
-        Number of orbitals in each subspace.
-    noccus
-        Number of particles in each subspace.
-    sizes
-        Dimension of each subspace, ``comb(norb[i], noccu[i])``.
-    num_subspaces
-        Number of subspaces
-    num_orbitals
-        Number of orbitals
-    dim
-        Number of states in basis
-    """
     shapes: List[Tuple[int, int]]
     norbs: List[int] = field(init=False)
     noccus: List[int] = field(init=False)
     sizes: List[int] = field(init=False)
-
     num_subspaces: int = field(init=False)
     num_orbitals: int = field(init=False)
     dim: int = field(init=False)
-
     offsets: Tuple[int, ...] = field(init=False)
     strides: Tuple[int, ...] = field(init=False)
     min_decode: int = field(init=False)
@@ -63,9 +38,7 @@ class FockBinByN:
             offsets.append(running)
         self.offsets = tuple(offsets)
 
-        extrema = min_max_decode(self.shapes)
-        self.min_decode = extrema[0]
-        self.max_decode = extrema[1]
+        self.min_decode, self.max_decode = min_max_decode(self.shapes)
 
         stride = 1
         strides = [0] * self.num_subspaces
@@ -74,89 +47,34 @@ class FockBinByN:
             stride *= self.sizes[n]
         self.strides = tuple(strides)
 
-
     def encode(self, b: int) -> int:
-        """Encode occupations into a basis index.
-    
-        Parameters
-        ----------
-        b: int
-            0/1 occupation vector encoded as an integer
-    
-        Returns
-        -------
-        index
-            Basis index in ``[0, space.dim - 1]``.
-        """
-        index = 0
-        if b < self.min_decode or b > self.max_decode:
-            return -1
-
-        for n in range(self.num_subspaces):
-            start = self.offsets[n]
-            N = self.norbs[n]
-            M = self.noccus[n]
-            mask = (1 << N) - 1
-
-            sub_bits = (b >> start) & mask
-            if sub_bits.bit_count() != M:
-                return -1
-
-            sub_rank = hash_encoder(sub_bits, N, M)
-            index += sub_rank * self.strides[n]
-
-        return index
+        return encode_basis_py(b, self.norbs, self.noccus, self.offsets, self.strides,
+                               self.min_decode, self.max_decode)
 
     def decode(self, index: int) -> int:
-        """Decode a basis index into occupations.
-    
-        Parameters
-        ----------
-        index
-            basis index in ``[0, space.dim - 1]``.
-    
-        Returns
-        -------
-        b: int
-            0/1 occupation vector encoded as an integer
+        return decode_basis_py(index, self.norbs, self.noccus, self.offsets, self.sizes)
 
+    def jit_args(self):
         """
-        b = 0
+        Small metadata only. No full state table.
+        """
+        return (
+            np.asarray(self.norbs, dtype=np.int64),
+            np.asarray(self.noccus, dtype=np.int64),
+            np.asarray(self.offsets, dtype=np.int64),
+            np.asarray(self.sizes, dtype=np.int64),
+            np.asarray(self.strides, dtype=np.int64),
+            np.int64(self.min_decode),
+            np.int64(self.max_decode),
+        )
 
-        for n in reversed(range(self.num_subspaces)):
-            d = self.sizes[n]
-            sub_rank = index % d
-            index //= d
-
-            sub_bits = hash_decoder(sub_rank, self.norbs[n], self.noccus[n])
-            b |= (sub_bits << self.offsets[n])
-
-        return b
 
 
 def hash_decoder(r: int, N: int, M: int) -> int:
-    """Unrank a bitstring encoded as an integer.
-
-    Parameters
-    ----------
-    r: int
-        Rank in ``[0, comb(N, M) - 1]``.
-    N: int
-        Bitstring length (number of orbitals).
-    M: int
-        Number of ones.
-
-    Returns
-    -------
-    b: int
-        0/1 occupation vector encoded as an integer
-
-    """
     b = 0
     j = M
     i = N - 1
-
-    c = comb(i, j) # MPMD store me?
+    c = comb(i, j)
     while i >= 0 and j > 0:
         if c <= r:
             b |= (1 << i)
@@ -172,216 +90,28 @@ def hash_decoder(r: int, N: int, M: int) -> int:
                 break
             c = (c * (i - j)) // i
             i -= 1
-
     return b
 
 
 def hash_encoder(b: int, N: int, M: int) -> int:
-    """Rank a fixed-weight bitstring encoded as an integer.
-
-    Parameters
-    ----------
-    b:int
-        0/1 occupation vector encoded as an integer
-    N: int
-        Bitstring length (number of orbitals).
-    M: int
-        Number of ones.
-
-    Returns
-    -------
-    int
-        Rank of the state.
-    """
     b = int(b) & ((1 << N) - 1)
-
     r = 0
     k = 1
     while b:
         lsb = b & -b
-        pos = lsb.bit_length() - 1
+        pos = 0
+        t = lsb
+        while t > 1:
+            t >>= 1
+            pos += 1
         r += comb(pos, k)
         k += 1
         b ^= lsb
     return r
 
 
-def sign_count(b: int, orb: int, norb: int) -> int:
-    """(-1)**(number of 1) up to position orb
-    in b."""
-    bitpos = norb - 1 - orb
-    prefix = b >> (bitpos + 1)
-    return 1 if (prefix.bit_count() % 2 == 0) else -1
-
-
-def bit_at_orb(b: int, orb: int, norb: int) -> int:
-    """
-    Return the bit value at orbital `orb` in b
-    """
-    bitpos = norb - 1 - orb
-    return (b >> bitpos) & 1
-
-
-def set_zero_at_orb(b: int, orb: int, norb: int) -> int:
-    """
-    Return a new integer where b[orb] == 0,
-    """
-    bitpos = norb - 1 - orb
-    return b & ~(1 << bitpos)
-
-
-def set_one_at_orb(b: int, orb: int, norb: int) -> int:
-    """
-    Return a new integer where b[orb] == 1,
-    """
-    bitpos = norb - 1 - orb
-    return b | (1 << bitpos)
-
-
-def two_fermion_B(emat, lb, rb=None, tol=1E-10):
-    """
-    Build the csr sparse matrix form of a two-fermionic operator
-    in the given Fock basis,
-
-    .. math::
-
-        <F_{l}|\\sum_{ij}E_{ij}\\hat{f}_{i}^{\\dagger}\\hat{f}_{j}|F_{r}>
-
-    Parameters
-    ----------
-    emat: 2d complex array
-        The impurity matrix.
-    lb: FockBinByN
-        Left fock basis :math:`<F_{l}|`.
-    rb: FockBinByN
-        Right fock basis :math:`|F_{r}>`.
-        rb = lb if rb is None
-    tol: float (default: 1E-10)
-        Only consider the elements of emat that are larger than tol.
-
-    Returns
-    -------
-    indptr, indices, data, nl, nr: various numpy arrays
-        The matrix form of the two-fermionic operator expressed as csr
-    """
-    if rb is None:
-        rb = lb
-
-    a1, a2 = np.nonzero(abs(emat) > tol)
-    nonzero = np.stack((a1, a2), axis=-1)
-
-    rows = []
-    cols = []
-    data = []
-    norb = rb.num_orbitals
-    
-    for iorb, jorb in nonzero:
-        for icfg in range(rb.dim):
-            b = rb.decode(icfg)
-            if bit_at_orb(b, jorb, norb) == 0:
-                continue
-            else:
-                s1 = sign_count(b, jorb, norb)
-                b = set_zero_at_orb(b, jorb, norb)
-            if bit_at_orb(b, iorb, norb) == 1:
-                continue
-            else:
-                s2 = sign_count(b, iorb, norb)
-                b = set_one_at_orb(b, iorb, norb)
-            jcfg = lb.encode(b)
-            if jcfg != -1:
-                 rows.append(jcfg)
-                 cols.append(icfg)
-                 data.append(emat[iorb, jorb] * s1 * s2)
-
-    # We want to interface between the functions using csr. Eventually, we need to generate 
-    # these directly, for now, let scipy convert.
-    A = coo_matrix((data, (rows, cols)), shape=(lb.dim, rb.dim), dtype=np.complex128).tocsr()
-    return A.indptr, A.indices, A.data, lb.dim, rb.dim
-
-
-def four_fermion_B(umat, lb, rb=None, tol=1E-10):
-    """
-    Build the csr sparse  matrix form of a four-fermionic operator
-    in the given Fock basis,
-
-    .. math::
-
-        <F_l|\\sum_{ij}U_{ijkl}\\hat{f}_{i}^{\\dagger}\\hat{f}_{j}^{\\dagger}
-        \\hat{f}_{k}\\hat{f}_{l}|F_r>
-
-    Parameters
-    ----------
-    umat: 4d complex array
-        The 4 index Coulomb interaction tensor.
-    lb: FockBinByN
-        Left fock basis :math:`<F_{l}|`.
-    rb: FockBinByN
-        Right fock basis :math:`|F_{r}>`.
-        rb = lb if rb is None
-    tol: float (default: 1E-10)
-        Only consider the elements of umat that are larger than tol.
-
-    Returns
-    -------
-    indptr, indices, data, nl, nr: various numpy arrays
-        The matrix form of the two-fermionic operator expressed as csr
-    """
-    if rb is None:
-        rb = lb
-
-    a1, a2, a3, a4 = np.nonzero(abs(umat) > tol)
-    nonzero = np.stack((a1, a2, a3, a4), axis=-1)
-
-    rows = []
-    cols = []
-    data = []
-    norb = rb.num_orbitals
-
-    for lorb, korb, jorb, iorb in nonzero:
-        if iorb == jorb or korb == lorb:
-            continue
-        for icfg in range(rb.dim):
-            b = rb.decode(icfg)
-            if bit_at_orb(b, iorb, norb) == 0:
-                continue
-            else:
-                s1 = sign_count(b, iorb, norb)
-                b = set_zero_at_orb(b, iorb, norb)
-            if bit_at_orb(b, jorb, norb) == 0:
-                continue
-            else:
-                s2 = sign_count(b, jorb, norb)
-                b = set_zero_at_orb(b, jorb, norb)
-            if bit_at_orb(b, korb, norb) == 1:
-                continue
-            else:
-                s3 = sign_count(b, korb, norb)
-                b = set_one_at_orb(b, korb, norb)
-            if bit_at_orb(b, lorb, norb) == 1:
-                continue
-            else:
-                s4 = sign_count(b, lorb, norb)
-                b = set_one_at_orb(b, lorb, norb)
-            jcfg = lb.encode(b)
-            if jcfg != -1:
-                 rows.append(jcfg)
-                 cols.append(icfg)
-                 data.append(umat[lorb, korb, jorb, iorb] * s1 * s2 * s3 * s4)
-
-    # We want to interface between the functions using csr. Eventually, we need to generate 
-    # these directly, for now, let scipy convert.
-    A = coo_matrix((data, (rows, cols)), shape=(lb.dim, rb.dim), dtype=np.complex128).tocsr()
-    return A.indptr, A.indices, A.data, lb.dim, rb.dim
-
-
 def min_max_decode(shapes):
-    """Smallest and largest decoding values for a specific
-    shape. Needed to block attempts to rank integers out 
-    of range."""
-    Ns = [N for N, _ in shapes]
-    totalN = sum(Ns)
-
+    totalN = sum(N for N, _ in shapes)
     b_min = 0
     b_max = 0
     running = totalN
@@ -391,131 +121,310 @@ def min_max_decode(shapes):
         sub_max = ((1 << M) - 1) << (N - M)
         b_min |= sub_min << running
         b_max |= sub_max << running
-
     return b_min, b_max
- 
-
-# from petsc4py import PETSc
-
-# def get_H_emat(comm, emat, lb, rb=None):
-#     assert comm.Get_size() == 1, " paralization decision not taken yparalleet. "
-#     indptr, indices, data, nl, nr = two_fermion_B(emat, lb, rb)
-#     return PETSc.Mat().createAIJ(comm=comm, size=(nl, nr), csr=(indptr, indices, data))
 
 
-# def get_H_umat(comm, umat, lb, rb=None):
-#     assert comm.Get_size() == 1, " paralization decision not taken yparalleet. "
-#     indptr, indices, data, nl, nr = four_fermion_B(umat, lb, rb)
-#     return PETSc.Mat().createAIJ(comm=comm, size=(nl, nr), csr=(indptr, indices, data))
 
-def get_H(comm, emat, umat, lb, rb=None, tol_e=1e-10, tol_u=1e-10,
-                nnz_guess_per_row=None):
-    """
-    Assemble H = sum_ij emat_ij f_i^† f_j + sum_ijkl umat_lkji f_l^† f_k^† f_j f_i
-    into a single parallel AIJ matrix.
+@njit(cache=True, inline="always")
+def comb_jit(n, k):
+    if k < 0 or k > n:
+        return 0
+    if k == 0 or k == n:
+        return 1
+    if k > n - k:
+        k = n - k
+    c = 1
+    for i in range(k):
+        c = (c * (n - i)) // (i + 1)
+    return c
 
-    Work is distributed by owned columns (right-basis indices icfg).
-    """
+
+@njit(cache=True, inline="always")
+def popcount_u64(x):
+    c = 0
+    while x != np.uint64(0):
+        x &= x - np.uint64(1)
+        c += 1
+    return c
+
+
+@njit(cache=True, inline="always")
+def hash_decoder_jit(r, N, M):
+    b = np.uint64(0)
+    j = M
+    i = N - 1
+    c = comb_jit(i, j)
+
+    while i >= 0 and j > 0:
+        if c <= r:
+            b |= np.uint64(1) << np.uint64(i)
+            r -= c
+            old_i, old_j = i, j
+            i -= 1
+            j -= 1
+            if j == 0 or i < 0:
+                break
+            c = (c * old_j) // old_i
+        else:
+            if i == 0:
+                break
+            c = (c * (i - j)) // i
+            i -= 1
+    return b
+
+
+@njit(cache=True, inline="always")
+def hash_encoder_jit(b, N, M):
+    b = np.uint64(b) & ((np.uint64(1) << np.uint64(N)) - np.uint64(1))
+    r = 0
+    k = 1
+    while b != np.uint64(0):
+        lsb = b & (np.uint64(0) - b)
+        pos = 0
+        t = lsb
+        while t > np.uint64(1):
+            t >>= np.uint64(1)
+            pos += 1
+        r += comb_jit(pos, k)
+        k += 1
+        b ^= lsb
+    return r
+
+
+
+@njit(cache=True, inline="always")
+def bit_at_orb_u64(b, orb, norb):
+    bitpos = np.uint64(norb - 1 - orb)
+    return (b >> bitpos) & np.uint64(1)
+
+
+@njit(cache=True, inline="always")
+def set_zero_at_orb_u64(b, orb, norb):
+    bitpos = np.uint64(norb - 1 - orb)
+    return b & ~(np.uint64(1) << bitpos)
+
+
+@njit(cache=True, inline="always")
+def set_one_at_orb_u64(b, orb, norb):
+    bitpos = np.uint64(norb - 1 - orb)
+    return b | (np.uint64(1) << bitpos)
+
+
+@njit(cache=True, inline="always")
+def sign_count_u64(b, orb, norb):
+    bitpos = np.uint64(norb - 1 - orb)
+    prefix = b >> (bitpos + np.uint64(1))
+    return 1 if (popcount_u64(prefix) % 2 == 0) else -1
+
+
+
+@njit(cache=True)
+def decode_basis_jit(index, norbs, noccus, offsets, sizes):
+    b = np.uint64(0)
+    for n in range(len(norbs) - 1, -1, -1):
+        d = sizes[n]
+        sub_rank = index % d
+        index //= d
+        sub_bits = hash_decoder_jit(sub_rank, norbs[n], noccus[n])
+        b |= np.uint64(sub_bits) << np.uint64(offsets[n])
+    return b
+
+
+@njit(cache=True)
+def encode_basis_jit(b, norbs, noccus, offsets, strides, min_decode, max_decode):
+    if b < min_decode or b > max_decode:
+        return -1
+
+    index = 0
+    for n in range(len(norbs)):
+        start = offsets[n]
+        N = norbs[n]
+        M = noccus[n]
+        mask = (np.uint64(1) << np.uint64(N)) - np.uint64(1)
+        sub_bits = (b >> np.uint64(start)) & mask
+
+        if popcount_u64(sub_bits) != M:
+            return -1
+
+        index += hash_encoder_jit(sub_bits, N, M) * strides[n]
+
+    return index
+
+
+def decode_basis_py(index, norbs, noccus, offsets, sizes):
+    norbs = np.asarray(norbs, dtype=np.int64)
+    noccus = np.asarray(noccus, dtype=np.int64)
+    offsets = np.asarray(offsets, dtype=np.int64)
+    sizes = np.asarray(sizes, dtype=np.int64)
+    return int(decode_basis_jit(np.int64(index), norbs, noccus, offsets, sizes))
+
+
+def encode_basis_py(b, norbs, noccus, offsets, strides, min_decode, max_decode):
+    norbs = np.asarray(norbs, dtype=np.int64)
+    noccus = np.asarray(noccus, dtype=np.int64)
+    offsets = np.asarray(offsets, dtype=np.int64)
+    strides = np.asarray(strides, dtype=np.int64)
+    return int(encode_basis_jit(np.uint64(b), norbs, noccus, offsets, strides,
+                                np.uint64(min_decode), np.uint64(max_decode)))
+
+
+
+@njit(cache=True)
+def build_H_entries(
+    norbs, noccus, offsets, sizes, strides, min_decode, max_decode,
+    e_terms, e_vals, u_terms, u_vals,
+    cstart, cend
+):
+    rows = []
+    cols = []
+    vals = []
+
+    norb_total = 0
+    for x in norbs:
+        norb_total += x
+
+    for icfg in range(cstart, cend):
+        b0 = decode_basis_jit(icfg, norbs, noccus, offsets, sizes)
+
+        # 1-body
+        for t in range(e_terms.shape[0]):
+            iorb = int(e_terms[t, 0])
+            jorb = int(e_terms[t, 1])
+            e = e_vals[t]
+
+            if bit_at_orb_u64(b0, jorb, norb_total) == 0:
+                continue
+
+            s1 = sign_count_u64(b0, jorb, norb_total)
+            b = set_zero_at_orb_u64(b0, jorb, norb_total)
+
+            if bit_at_orb_u64(b, iorb, norb_total) == 1:
+                continue
+
+            s2 = sign_count_u64(b, iorb, norb_total)
+            b = set_one_at_orb_u64(b, iorb, norb_total)
+
+            jcfg = encode_basis_jit(b, norbs, noccus, offsets, strides, min_decode, max_decode)
+            if jcfg != -1:
+                rows.append(jcfg)
+                cols.append(icfg)
+                vals.append(e * s1 * s2)
+
+        # 2-body
+        for t in range(u_terms.shape[0]):
+            lorb = int(u_terms[t, 0])
+            korb = int(u_terms[t, 1])
+            jorb = int(u_terms[t, 2])
+            iorb = int(u_terms[t, 3])
+            u = u_vals[t]
+
+            if iorb == jorb or korb == lorb:
+                continue
+
+            if bit_at_orb_u64(b0, iorb, norb_total) == 0:
+                continue
+            s1 = sign_count_u64(b0, iorb, norb_total)
+            b = set_zero_at_orb_u64(b0, iorb, norb_total)
+
+            if bit_at_orb_u64(b, jorb, norb_total) == 0:
+                continue
+            s2 = sign_count_u64(b, jorb, norb_total)
+            b = set_zero_at_orb_u64(b, jorb, norb_total)
+
+            if bit_at_orb_u64(b, korb, norb_total) == 1:
+                continue
+            s3 = sign_count_u64(b, korb, norb_total)
+            b = set_one_at_orb_u64(b, korb, norb_total)
+
+            if bit_at_orb_u64(b, lorb, norb_total) == 1:
+                continue
+            s4 = sign_count_u64(b, lorb, norb_total)
+            b = set_one_at_orb_u64(b, lorb, norb_total)
+
+            jcfg = encode_basis_jit(b, norbs, noccus, offsets, strides, min_decode, max_decode)
+            if jcfg != -1:
+                rows.append(jcfg)
+                cols.append(icfg)
+                vals.append(u * s1 * s2 * s3 * s4)
+
+    return np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64), np.asarray(vals, dtype=np.complex128)
+
+
+
+def assemble_petsc_from_entries(comm, nl, nr, rows, cols, vals, nnz_guess_per_row=16):
+    H = PETSc.Mat().create(comm=comm)
+    H.setSizes(((None, nl), (None, nr)))
+    #H.setType(PETSc.Mat.Type.AIJ)
+    H.setType("aijcusparse")
+    H.setPreallocationNNZ(nnz_guess_per_row)
+    H.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, False)
+    H.setUp()
+
+    if rows.size:
+        order = np.argsort(rows, kind="mergesort")
+        rows = rows[order]
+        cols = cols[order]
+        vals = vals[order]
+
+        start = 0
+        while start < rows.size:
+            r = int(rows[start])
+            end = start + 1
+            while end < rows.size and rows[end] == rows[start]:
+                end += 1
+            H.setValues(r, cols[start:end], vals[start:end], addv=PETSc.InsertMode.ADD_VALUES)
+            start = end
+
+    H.assemblyBegin()
+    H.assemblyEnd()
+    return H
+
+
+
+def get_H(comm, emat, umat, lb, rb=None, tol_e=1e-10, tol_u=1e-10, nnz_guess_per_row=None):
     if rb is None:
         rb = lb
+
     nl, nr = lb.dim, rb.dim
-    norb = rb.num_orbitals
 
     H = PETSc.Mat().create(comm=comm)
     H.setSizes(((None, nl), (None, nr)))
     H.setType(PETSc.Mat.Type.AIJ)
+    H.setType("aijcusparse")
 
-    # Heuristic preallocation (tune as needed); allow growth to stay correct.
     if nnz_guess_per_row is None:
-        # crude but safe starting point
         ne = int(np.count_nonzero(np.abs(emat) > tol_e)) if emat is not None else 0
         nu = int(np.count_nonzero(np.abs(umat) > tol_u)) if umat is not None else 0
-        # cap to something reasonable
-        nnz_guess_per_row = max(8, min(nr, 16 + ne + 2*min(nu, 32)))
+        nnz_guess_per_row = max(8, min(nr, 16 + ne + 2 * min(nu, 32)))
 
     H.setPreallocationNNZ(nnz_guess_per_row)
     H.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, False)
     H.setUp()
 
     cstart, cend = H.getOwnershipRangeColumn()
+    print(f"cstart = {cstart}, cend = {cend}")
+    norbs, noccus, offsets, sizes, strides, min_decode, max_decode = rb.jit_args()
 
-    rowacc = {}  # row -> dict(col -> value)
-
-    # --- 1-body contributions ---
     if emat is not None:
         a1, a2 = np.nonzero(np.abs(emat) > tol_e)
-        nonzero_e = np.stack((a1, a2), axis=-1)
+        e_terms = np.stack((a1, a2), axis=-1).astype(np.int64)
+        e_vals = emat[a1, a2].astype(np.complex128)
+    else:
+        e_terms = np.empty((0, 2), dtype=np.int64)
+        e_vals = np.empty((0,), dtype=np.complex128)
 
-        for iorb, jorb in nonzero_e:
-            e = emat[iorb, jorb]
-            for icfg in range(cstart, cend):
-                b0 = rb.decode(icfg)
-
-                if bit_at_orb(b0, jorb, norb) == 0:
-                    continue
-                s1 = sign_count(b0, jorb, norb)
-                b = set_zero_at_orb(b0, jorb, norb)
-
-                if bit_at_orb(b, iorb, norb) == 1:
-                    continue
-                s2 = sign_count(b, iorb, norb)
-                b = set_one_at_orb(b, iorb, norb)
-
-                jcfg = lb.encode(b)
-                if jcfg == -1:
-                    continue
-
-                val = e * s1 * s2
-                d = rowacc.setdefault(jcfg, {})
-                d[icfg] = d.get(icfg, 0.0) + val
-
-    # --- 2-body contributions ---
     if umat is not None:
         a1, a2, a3, a4 = np.nonzero(np.abs(umat) > tol_u)
-        nonzero_u = np.stack((a1, a2, a3, a4), axis=-1)
+        u_terms = np.stack((a1, a2, a3, a4), axis=-1).astype(np.int64)
+        u_vals = umat[a1, a2, a3, a4].astype(np.complex128)
+    else:
+        u_terms = np.empty((0, 4), dtype=np.int64)
+        u_vals = np.empty((0,), dtype=np.complex128)
 
-        for lorb, korb, jorb, iorb in nonzero_u:
-            if iorb == jorb or korb == lorb:
-                continue
-            u = umat[lorb, korb, jorb, iorb]
+    rows, cols, vals = build_H_entries(
+        norbs, noccus, offsets, sizes, strides, min_decode, max_decode,
+        e_terms, e_vals, u_terms, u_vals,
+        cstart, cend,
+    )
 
-            for icfg in range(cstart, cend):
-                b0 = rb.decode(icfg)
-
-                if bit_at_orb(b0, iorb, norb) == 0:
-                    continue
-                s1 = sign_count(b0, iorb, norb)
-                b = set_zero_at_orb(b0, iorb, norb)
-
-                if bit_at_orb(b, jorb, norb) == 0:
-                    continue
-                s2 = sign_count(b, jorb, norb)
-                b = set_zero_at_orb(b, jorb, norb)
-
-                if bit_at_orb(b, korb, norb) == 1:
-                    continue
-                s3 = sign_count(b, korb, norb)
-                b = set_one_at_orb(b, korb, norb)
-
-                if bit_at_orb(b, lorb, norb) == 1:
-                    continue
-                s4 = sign_count(b, lorb, norb)
-                b = set_one_at_orb(b, lorb, norb)
-
-                jcfg = lb.encode(b)
-                if jcfg == -1:
-                    continue
-
-                val = u * s1 * s2 * s3 * s4
-                d = rowacc.setdefault(jcfg, {})
-                d[icfg] = d.get(icfg, 0.0) + val
-
-    # Insert everything (off-proc rows ok; PETSc communicates on assembly)
-    for row, coldict in rowacc.items():
-        cols = np.fromiter(coldict.keys(), dtype=PETSc.IntType)
-        vals = np.fromiter(coldict.values(), dtype=np.complex128)
-        H.setValues(row, cols, vals, addv=PETSc.InsertMode.ADD_VALUES)
-
-    H.assemblyBegin()
-    H.assemblyEnd()
-    return H
+    return assemble_petsc_from_entries(comm, nl, nr, rows, cols, vals, nnz_guess_per_row)

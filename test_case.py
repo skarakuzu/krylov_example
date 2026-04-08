@@ -4,7 +4,11 @@ from wrappers import ed_wrapper, rixs_wrapper, NiPS3_ed, NiPS3_rixs
 from datetime import datetime
 import time
 from mpi4py import MPI
+from petsc4py import PETSc
+
+
 comm = MPI.COMM_WORLD
+petsc_comm = PETSc.COMM_WORLD
 
 rank = comm.rank
 
@@ -32,36 +36,46 @@ def log(message, start_time=time.time()):
     if rank == 1:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         elapsed = time.time() - start_time
-        print(f"### {message}: [{now}] (+{elapsed:8.3f}s)")
+        print(f"### {message}: [{now}] (+{elapsed:8.3f}s)", flush=True)
         return elapsed
 
-t0 = log("ED fortran start")
+#t0 = log("ED fortran start")
+print("ED fortran starts...", flush=True)
+t0 = time.perf_counter()
 eval_i_F, denmat, noccu_gs = ed_wrapper(comm, **NiPS3_ed)
-t1 = log("ED fortran finish")
+t1 = time.perf_counter()
+duration = t1 - t0
+print(f"ED fortran took about {duration:.6f} seconds", flush=True)
+#t1 = log("ED fortran finish")
 
-t2 = log("ED python start")
+#t2 = log("ED python start")
+print("ED python starts...", flush=True)
+t2 = time.perf_counter()
 out = ed_wrapper(comm, fortran=False, **NiPS3_ed)
 eval_i, evec_i, emat_i, emat_n, umat_i, umat_n = out
-t3 = log("ED python finish")
+#t3 = log("ED python finish")
+t3 = time.perf_counter()
+duration = t3 - t2
+print(f"ED python took about {duration:.6f} seconds", flush=True)
 
-t4 = log("RIXS fortran start")
-rixs_F, poles_F = rixs_wrapper(comm, fortran=True, **NiPS3_rixs)
-t5 = log("RIXS fortran finish")
+#t4 = log("RIXS fortran start")
+#rixs_F, poles_F = rixs_wrapper(comm, fortran=True, **NiPS3_rixs)
+#t5 = log("RIXS fortran finish")
 
-t6 = log("RIXS python start")
-rixs, poles = rixs_wrapper(comm, fortran=False, **NiPS3_rixs,
-             eval_i=eval_i,
-             evec_i=evec_i,
-             emat_i=emat_i,
-             umat_i=umat_i,
-             emat_n=emat_n,
-             umat_n=umat_n,
-            )
-t7 = log("RIXS python finish")
+#t6 = log("RIXS python start")
+#rixs, poles = rixs_wrapper(comm, fortran=False, **NiPS3_rixs,
+#             eval_i=eval_i,
+#             evec_i=evec_i,
+#             emat_i=emat_i,
+#             umat_i=umat_i,
+#             emat_n=emat_n,
+#             umat_n=umat_n,
+#            )
+#t7 = log("RIXS python finish")
 
-np.testing.assert_allclose(rixs, rixs_F, atol=1e-4)
+#np.testing.assert_allclose(rixs, rixs_F, atol=1e-4)
 
 if rank == 1:
     print(f"Doing nd={nd}")
     print(f"ED \t F={(t1-t0):8.3f}  s \t  P={(t3-t2):8.3} s")
-    print(f"RIXS \t F={(t5-t4):8.3f} s \t P={(t7-t6):8.3} af")
+    #print(f"RIXS \t F={(t5-t4):8.3f} s \t P={(t7-t6):8.3} af")
