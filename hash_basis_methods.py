@@ -350,12 +350,11 @@ def build_H_entries(
     return np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64), np.asarray(vals, dtype=np.complex128)
 
 
-
 def assemble_petsc_from_entries(comm, nl, nr, rows, cols, vals, nnz_guess_per_row=16):
     H = PETSc.Mat().create(comm=comm)
     H.setSizes(((None, nl), (None, nr)))
-    #H.setType(PETSc.Mat.Type.AIJ)
-    H.setType("aijcusparse")
+    H.setType(PETSc.Mat.Type.AIJ)
+    #H.setType("aijcusparse")
     H.setPreallocationNNZ(nnz_guess_per_row)
     H.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, False)
     H.setUp()
@@ -377,7 +376,8 @@ def assemble_petsc_from_entries(comm, nl, nr, rows, cols, vals, nnz_guess_per_ro
 
     H.assemblyBegin()
     H.assemblyEnd()
-    return H
+    H_gpu = H.convert("aijcusparse")
+    return H_gpu
 
 
 
@@ -390,7 +390,7 @@ def get_H(comm, emat, umat, lb, rb=None, tol_e=1e-10, tol_u=1e-10, nnz_guess_per
     H = PETSc.Mat().create(comm=comm)
     H.setSizes(((None, nl), (None, nr)))
     H.setType(PETSc.Mat.Type.AIJ)
-    H.setType("aijcusparse")
+    #H.setType("aijcusparse")
 
     if nnz_guess_per_row is None:
         ne = int(np.count_nonzero(np.abs(emat) > tol_e)) if emat is not None else 0
