@@ -270,23 +270,29 @@ def encode_basis_py(b, norbs, noccus, offsets, strides, min_decode, max_decode):
 
 
 @njit(cache=True)
-def build_H_entries(
-    norbs, noccus, offsets, sizes, strides, min_decode, max_decode,
-    e_terms, e_vals, u_terms, u_vals,
-    cstart, cend
+def build_H_entries_lr(
+    rb_norbs, rb_noccus, rb_offsets, rb_sizes, rb_strides, rb_min_decode, rb_max_decode,
+    lb_norbs, lb_noccus, lb_offsets, lb_sizes, lb_strides, lb_min_decode, lb_max_decode,
+    e_terms, e_vals, u_terms, u_vals, cstart, cend,
 ):
+    """Build row/col/value triplets for an operator mapping rb -> lb.
+
+    The right basis is used for decoding column configurations.
+    The left basis is used for encoding the transformed configuration
+    back into a row index.
+    """
     rows = []
     cols = []
     vals = []
 
     norb_total = 0
-    for x in norbs:
+    for x in rb_norbs:
         norb_total += x
 
+    # 1-body terms: sum_ij e_{ij} f_i^dagger f_j
     for icfg in range(cstart, cend):
-        b0 = decode_basis_jit(icfg, norbs, noccus, offsets, sizes)
+        b0 = decode_basis_jit(icfg, rb_norbs, rb_noccus, rb_offsets, rb_sizes)
 
-        # 1-body
         for t in range(e_terms.shape[0]):
             iorb = int(e_terms[t, 0])
             jorb = int(e_terms[t, 1])
@@ -294,23 +300,24 @@ def build_H_entries(
 
             if bit_at_orb_u64(b0, jorb, norb_total) == 0:
                 continue
-
             s1 = sign_count_u64(b0, jorb, norb_total)
             b = set_zero_at_orb_u64(b0, jorb, norb_total)
 
             if bit_at_orb_u64(b, iorb, norb_total) == 1:
                 continue
-
             s2 = sign_count_u64(b, iorb, norb_total)
             b = set_one_at_orb_u64(b, iorb, norb_total)
 
-            jcfg = encode_basis_jit(b, norbs, noccus, offsets, strides, min_decode, max_decode)
+            jcfg = encode_basis_jit(
+                b,
+                lb_norbs, lb_noccus, lb_offsets, lb_strides, lb_min_decode, lb_max_decode,
+            )
             if jcfg != -1:
                 rows.append(jcfg)
                 cols.append(icfg)
                 vals.append(e * s1 * s2)
 
-        # 2-body
+        # 2-body terms: sum_lkji u_{lkji} f_l^dagger f_k^dagger f_j f_i
         for t in range(u_terms.shape[0]):
             lorb = int(u_terms[t, 0])
             korb = int(u_terms[t, 1])
@@ -320,7 +327,6 @@ def build_H_entries(
 
             if iorb == jorb or korb == lorb:
                 continue
-
             if bit_at_orb_u64(b0, iorb, norb_total) == 0:
                 continue
             s1 = sign_count_u64(b0, iorb, norb_total)
@@ -341,24 +347,29 @@ def build_H_entries(
             s4 = sign_count_u64(b, lorb, norb_total)
             b = set_one_at_orb_u64(b, lorb, norb_total)
 
-            jcfg = encode_basis_jit(b, norbs, noccus, offsets, strides, min_decode, max_decode)
+            jcfg = encode_basis_jit(
+                b,
+                lb_norbs, lb_noccus, lb_offsets, lb_strides, lb_min_decode, lb_max_decode,
+            )
             if jcfg != -1:
                 rows.append(jcfg)
                 cols.append(icfg)
                 vals.append(u * s1 * s2 * s3 * s4)
 
-    return np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64), np.asarray(vals, dtype=np.complex128)
-
+    return np.asarray(rows, dtype=np.int32), np.asarray(cols, dtype=np.int32), np.asarray(vals, dtype=np.complex128)
 
 def assemble_petsc_from_entries(comm, nl, nr, rows, cols, vals, nnz_guess_per_row=16):
     H = PETSc.Mat().create(comm=comm)
     H.setSizes(((None, nl), (None, nr)))
     H.setType(PETSc.Mat.Type.AIJ)
     #H.setType("aijcusparse")
+    #H.setVecType(PETSc.Vec.Type.CUDA)
     H.setPreallocationNNZ(nnz_guess_per_row)
     H.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, False)
     H.setUp()
 
+    print(f"H type in has script: {H.getType()}", flush=True)
+    
     if rows.size:
         order = np.argsort(rows, kind="mergesort")
         rows = rows[order]
@@ -373,24 +384,29 @@ def assemble_petsc_from_entries(comm, nl, nr, rows, cols, vals, nnz_guess_per_ro
                 end += 1
             H.setValues(r, cols[start:end], vals[start:end], addv=PETSc.InsertMode.ADD_VALUES)
             start = end
+    
+
 
     H.assemblyBegin()
     H.assemblyEnd()
-    H_gpu = H.convert("aijcusparse")
-    return H_gpu
-
+    #H_gpu = H.convert("aijcusparse")
+    #return H_gpu
+    return H
 
 
 def get_H(comm, emat, umat, lb, rb=None, tol_e=1e-10, tol_u=1e-10, nnz_guess_per_row=None):
+    """Assemble H = sum_ij emat_ij f_i^dagger f_j + sum_lkji umat_lkji f_l^dagger f_k^dagger f_j f_i.
+
+    For rectangular operators, rb is the column basis and lb is the row basis.
+    For square operators, omit rb and lb is used on both sides.
+    """
     if rb is None:
         rb = lb
 
     nl, nr = lb.dim, rb.dim
-
     H = PETSc.Mat().create(comm=comm)
     H.setSizes(((None, nl), (None, nr)))
     H.setType(PETSc.Mat.Type.AIJ)
-    #H.setType("aijcusparse")
 
     if nnz_guess_per_row is None:
         ne = int(np.count_nonzero(np.abs(emat) > tol_e)) if emat is not None else 0
@@ -403,7 +419,9 @@ def get_H(comm, emat, umat, lb, rb=None, tol_e=1e-10, tol_u=1e-10, nnz_guess_per
 
     cstart, cend = H.getOwnershipRangeColumn()
     print(f"cstart = {cstart}, cend = {cend}")
-    norbs, noccus, offsets, sizes, strides, min_decode, max_decode = rb.jit_args()
+
+    rb_meta = rb.jit_args()
+    lb_meta = lb.jit_args()
 
     if emat is not None:
         a1, a2 = np.nonzero(np.abs(emat) > tol_e)
@@ -421,10 +439,10 @@ def get_H(comm, emat, umat, lb, rb=None, tol_e=1e-10, tol_u=1e-10, nnz_guess_per
         u_terms = np.empty((0, 4), dtype=np.int64)
         u_vals = np.empty((0,), dtype=np.complex128)
 
-    rows, cols, vals = build_H_entries(
-        norbs, noccus, offsets, sizes, strides, min_decode, max_decode,
-        e_terms, e_vals, u_terms, u_vals,
-        cstart, cend,
+    rows, cols, vals = build_H_entries_lr(
+        rb_meta[0], rb_meta[1], rb_meta[2], rb_meta[3], rb_meta[4], rb_meta[5], rb_meta[6],
+        lb_meta[0], lb_meta[1], lb_meta[2], lb_meta[3], lb_meta[4], lb_meta[5], lb_meta[6],
+        e_terms, e_vals, u_terms, u_vals, cstart, cend,
     )
 
     return assemble_petsc_from_entries(comm, nl, nr, rows, cols, vals, nnz_guess_per_row)

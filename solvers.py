@@ -620,7 +620,7 @@ def rixs_siam_petsc(comm,
             Dk = get_H(comm, trans_i, None, basis_n, basis_i)
             # Dkp = get_H_emat(comm, trans_f, basis_n, basis_i).hermitianTranspose()
             Dkp = get_H(comm, trans_f, None, basis_n, basis_i).hermitianTranspose()
-
+    
             pole_dict = {'npoles': [], 'eigval': [], 'norm': [],
               'alpha': [], 'beta': []}
 
@@ -642,7 +642,6 @@ def rixs_siam_petsc(comm,
                     raise RuntimeError(f"Not converged: {ksp.getConvergedReason()}")
                 
                 F = Dkp @ x
-
                 alpha_i, beta_i, norm_i = lanczos_tridiagonal(H, F, nkryl=nkryl)
                 pole_dict['npoles'].append(len(alpha_i))
                 pole_dict['eigval'].append(eval_i[ig])
