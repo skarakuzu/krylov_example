@@ -389,9 +389,9 @@ def assemble_petsc_from_entries(comm, nl, nr, rows, cols, vals, nnz_guess_per_ro
 
     H.assemblyBegin()
     H.assemblyEnd()
-    #H_gpu = H.convert("aijcusparse")
-    #return H_gpu
-    return H
+    H_gpu = H.convert("aijcusparse")
+    return H_gpu
+    #return H
 
 
 def get_H(comm, emat, umat, lb, rb=None, tol_e=1e-10, tol_u=1e-10, nnz_guess_per_row=None):
